@@ -6,6 +6,8 @@ compositor with wlr-layer-shell.
 
 - **Still and animated pictures:** JPEG, PNG and APNG, GIF, WebP (animated too), AVIF,
   BMP, TIFF, QOI. Phone photos are turned upright (EXIF).
+- **Looping videos:** MP4, MKV, WebM, MOV and anything else FFmpeg plays, silent, through
+  the `ffmpeg` command (install it: `sudo apt install ffmpeg`; pictures don't need it).
 - **Crossfades** when the picture changes, and on startup.
 - **A picture per screen**, or one for all; screens plugged in later get theirs.
 - **Fill modes:** cover, contain, stretch, center, tile.
@@ -77,9 +79,29 @@ is what makes them cost nothing to play. One whose frames would take more than
 `animation_memory` shows its first frame instead. Long or large animations will be
 better as videos, which are planned.
 
+## Videos
+
+Linux has no video decoding of its own (the kernel only drives hardware decoders), so
+videos need a media library; FFmpeg is the one every media player sits on. HeroWallpaper
+runs the plain `ffmpeg` command rather than a player like mpv (much bigger) or FFmpeg's
+libraries (their versions differ between distro releases, which would tie the package to
+one). ffmpeg decodes with hardware where there is some (`-hwaccel auto`), crops and
+scales to exactly the pixels the screen shows, and hands raw frames over a pipe; they go
+into shared memory the compositor reads. Frames are only read while the compositor draws
+the wallpaper, so ffmpeg waits whenever windows cover it.
+
+Measured on sway (a VM without a GPU, 1080p H.264 video on a 900×700 screen, software
+decoding): ffmpeg about 45% of one core and 98 MB, HeroWallpaper about 8% (copying
+frames) and 0.3 MB of its own memory. **Covered by a window: 0% for both.** With the
+theme's animations off (battery saver) or `animate = false`, ffmpeg runs once for the
+first frame and exits. A video wallpaper always costs more than a picture: a short
+looping animation as an animated WebP or APNG costs almost nothing to play.
+
 ## Planned
 
-- Videos (with hardware decoding), then streams and links.
+- Streams and links (ffmpeg plays URLs; YouTube through yt-dlp).
+- Lighter video: frames handed to the compositor as GPU buffers (no copies) where the
+  hardware decodes.
 - Animated AVIF and JPEG XL.
 
 ## Building

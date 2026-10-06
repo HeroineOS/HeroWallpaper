@@ -13,6 +13,7 @@
 mod config;
 mod picture;
 mod thumb;
+mod video;
 mod watch;
 mod wl;
 

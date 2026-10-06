@@ -31,10 +31,12 @@ copyright = "HeroineOS contributors"
 section = "x11"
 priority = "optional"
 depends = "$auto"
+# Videos play through the ffmpeg command.
+recommends = "ffmpeg"
 extended-description = """\
 A lightweight wallpaper for Wayland compositors with wlr-layer-shell \
 (HeroWM, sway, Hyprland, KDE...): still and animated pictures (JPEG, PNG/APNG, \
-GIF, WebP, AVIF, BMP, TIFF, QOI), crossfades, a picture per screen. Scaling \
+GIF, WebP, AVIF, BMP, TIFF, QOI) and looping videos (through ffmpeg), crossfades, a picture per screen. Scaling \
 and fading are left to the compositor, so it idles at well under a megabyte \
 of its own memory. Configured in ~/.config/hero/wallpaper.toml, or with \
 `herowallpaper set PICTURE`."""

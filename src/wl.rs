@@ -31,6 +31,7 @@ use wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_surface_v1::{self
 
 use crate::config::{Config, Mode, Theme};
 use crate::picture;
+use crate::video::{self, Video, SLOTS};
 
 #[derive(Default)]
 struct Globals {
@@ -65,6 +66,41 @@ struct Pic {
     opaque: bool,
     frame: std::cell::Cell<usize>,
     due: std::cell::Cell<Instant>,
+    /// A video: its frames go through `buffers` (one per slot).
+    video: Option<Playing>,
+}
+
+/// A video's frames in flight.
+struct Playing {
+    video: Video,
+    id: u32,
+    /// Slots the compositor is done reading.
+    released: std::cell::Cell<[bool; SLOTS]>,
+    /// The next frame, read and waiting for its time.
+    ready: std::cell::Cell<Option<usize>>,
+    /// A frame is being read.
+    asked: std::cell::Cell<bool>,
+}
+
+impl Playing {
+    /// Asks for the next frame, into a slot neither shown nor waiting.
+    fn ask_next(&self, shown: usize) {
+        if self.asked.get() || self.ready.get().is_some() || !self.video.moving {
+            return;
+        }
+        let released = self.released.get();
+        if let Some(s) = (0..SLOTS).find(|&s| s != shown && released[s]) {
+            self.asked.set(true);
+            self.video.ask(s);
+        }
+    }
+}
+
+/// Which video frame a buffer holds.
+#[derive(Clone, Copy)]
+struct VideoFrame {
+    id: u32,
+    slot: usize,
 }
 
 impl Drop for Pic {
@@ -176,6 +212,10 @@ pub struct State {
     theme: Theme,
     cache: Vec<Weak<Pic>>,
     qh: QueueHandle<State>,
+    /// Video readers say here when a frame is in: (id, slot).
+    frames_in: std::os::unix::net::UnixStream,
+    frames_out: std::os::unix::net::UnixStream,
+    next_video: u32,
 }
 
 /// The screens' names.
@@ -192,7 +232,9 @@ fn connect(config: Config) -> Result<Connected, String> {
     let mut queue = conn.new_event_queue();
     let qh = queue.handle();
     conn.display().get_registry(&qh, ());
-    let mut state = State { g: Globals::default(), screens: vec![], config, theme: Theme::load(), cache: vec![], qh };
+    let (frames_in, frames_out) = std::os::unix::net::UnixStream::pair().map_err(|e| e.to_string())?;
+    frames_in.set_nonblocking(true).map_err(|e| e.to_string())?;
+    let mut state = State { g: Globals::default(), screens: vec![], config, theme: Theme::load(), cache: vec![], qh, frames_in, frames_out, next_video: 0 };
     queue.roundtrip(&mut state).map_err(|e| e.to_string())?;
     Ok((conn, queue, state))
 }
@@ -241,9 +283,10 @@ pub fn run(config_path: PathBuf) -> Result<(), String> {
         let mut fds = [
             PollFd { fd: guard.connection_fd().as_raw_fd(), events: POLLIN, revents: 0 },
             PollFd { fd: watch.as_ref().map_or(-1, |w| w.fd()), events: POLLIN, revents: 0 },
+            PollFd { fd: state.frames_in.as_raw_fd(), events: POLLIN, revents: 0 },
         ];
         let timeout = next.map_or(-1, |t| t.saturating_duration_since(Instant::now()).as_micros().div_ceil(1000).min(i32::MAX as u128) as i32);
-        let n = unsafe { poll(fds.as_mut_ptr(), 2, timeout) };
+        let n = unsafe { poll(fds.as_mut_ptr(), 3, timeout) };
         if n < 0 {
             drop(guard);
             let e = std::io::Error::last_os_error();
@@ -260,6 +303,9 @@ pub fn run(config_path: PathBuf) -> Result<(), String> {
             }
         } else {
             drop(guard);
+        }
+        if fds[2].revents != 0 {
+            state.frames_read();
         }
         if fds[1].revents != 0 {
             if let Some(w) = &watch {
@@ -419,6 +465,9 @@ impl State {
         if let Some(p) = self.cache.iter().filter_map(Weak::upgrade).find(|p| &p.key == key) {
             return Ok(p);
         }
+        if video::is_video(&key.path) {
+            return self.video(key);
+        }
         let loaded = picture::load(&picture::Request {
             path: &key.path,
             mode: key.mode,
@@ -443,10 +492,76 @@ impl State {
             dest: loaded.dest,
             opaque: loaded.opaque,
             frame: std::cell::Cell::new(0),
+            video: None,
         });
         self.cache.push(Rc::downgrade(&pic));
         trim();
         Ok(pic)
+    }
+
+    /// Starts a video (its first frame in, for showing right away).
+    fn video(&mut self, key: &Key) -> Result<Rc<Pic>, String> {
+        let id = self.next_video;
+        self.next_video += 1;
+        let out = self.frames_out.try_clone().map_err(|e| e.to_string())?;
+        let v = Video::start(&key.path, key.mode, key.logical, key.scale120 as f64 / 120.0, key.animate, id, out).map_err(|e| format!("{}: {e}", key.path.display()))?;
+        let bytes = v.size.0 as usize * v.size.1 as usize * 4;
+        let total = i32::try_from(bytes * SLOTS).map_err(|_| "too large".to_string())?;
+        let pool = self.g.shm.as_ref().unwrap().create_pool(v.memory.as_fd(), total, &self.qh, ());
+        let (w, h) = (v.size.0 as i32, v.size.1 as i32);
+        let buffers = (0..SLOTS).map(|slot| pool.create_buffer((slot * bytes) as i32, w, h, w * 4, wl_shm::Format::Xrgb8888, &self.qh, VideoFrame { id, slot })).collect();
+        let playing = Playing { id, released: std::cell::Cell::new([false, true, true]), ready: std::cell::Cell::new(None), asked: std::cell::Cell::new(false), video: v };
+        // The second frame on its way already.
+        playing.ask_next(0);
+        let pic = Rc::new(Pic {
+            key: key.clone(),
+            pool,
+            buffers,
+            delays: vec![playing.video.interval],
+            dest: playing.video.dest,
+            opaque: true,
+            frame: std::cell::Cell::new(0),
+            due: std::cell::Cell::new(Instant::now() + playing.video.interval),
+            video: Some(playing),
+        });
+        self.cache.push(Rc::downgrade(&pic));
+        Ok(pic)
+    }
+
+    /// Every picture showing somewhere (each once).
+    fn shown_pics(&self) -> Vec<Rc<Pic>> {
+        let mut pics: Vec<Rc<Pic>> = vec![];
+        for s in &self.screens {
+            for slot in s.surf.iter().flat_map(|f| f.slots.iter()) {
+                if let Some(p) = &slot.pic {
+                    if !pics.iter().any(|q| Rc::ptr_eq(p, q)) {
+                        pics.push(p.clone());
+                    }
+                }
+            }
+        }
+        pics
+    }
+
+    /// Frames the video readers finished.
+    fn frames_read(&mut self) {
+        let mut buf = [0u8; 8 * 16];
+        loop {
+            let n = match std::io::Read::read(&mut &self.frames_in, &mut buf) {
+                Ok(n) if n > 0 => n,
+                _ => break,
+            };
+            for msg in buf[..n - n % 8].chunks_exact(8) {
+                let id = u32::from_ne_bytes(msg[..4].try_into().unwrap());
+                let slot = u32::from_ne_bytes(msg[4..].try_into().unwrap()) as usize;
+                for pic in self.shown_pics() {
+                    if let Some(p) = pic.video.as_ref().filter(|p| p.id == id) {
+                        p.asked.set(false);
+                        p.ready.set(Some(slot));
+                    }
+                }
+            }
+        }
     }
 
     /// The color under the picture: one pixel, stretched over the screen.
@@ -515,17 +630,9 @@ impl State {
         if !self.animate() {
             return next;
         }
-        // Animated pictures (each once, however many screens show it).
-        let mut pics: Vec<Rc<Pic>> = vec![];
-        for s in &self.screens {
-            for slot in s.surf.iter().flat_map(|f| f.slots.iter()) {
-                if let Some(p) = &slot.pic {
-                    if p.buffers.len() > 1 && !pics.iter().any(|q| Rc::ptr_eq(p, q)) {
-                        pics.push(p.clone());
-                    }
-                }
-            }
-        }
+        // Animated pictures and videos (each once, however many screens
+        // show it).
+        let pics: Vec<Rc<Pic>> = self.shown_pics().into_iter().filter(|p| p.buffers.len() > 1).collect();
         for pic in pics {
             let shows = |slot: &Slot| slot.pic.as_ref().is_some_and(|p| Rc::ptr_eq(p, &pic));
             // Only while the compositor is drawing it.
@@ -533,15 +640,33 @@ impl State {
             if !drawn {
                 continue;
             }
+            if let Some(p) = &pic.video {
+                // Read ahead, but only while drawn: covered, ffmpeg waits.
+                p.ask_next(pic.frame.get());
+                if p.ready.get().is_none() {
+                    // Woken by the reader when it's in.
+                    continue;
+                }
+            }
             if now < pic.due.get() {
                 soonest(pic.due.get());
                 continue;
             }
-            let f = (pic.frame.get() + 1) % pic.buffers.len();
+            let f = match &pic.video {
+                Some(p) => {
+                    let f = p.ready.take().unwrap();
+                    let mut r = p.released.get();
+                    r[f] = false;
+                    p.released.set(r);
+                    f
+                }
+                None => (pic.frame.get() + 1) % pic.buffers.len(),
+            };
             pic.frame.set(f);
-            let due = pic.due.get() + pic.delays[f];
+            let delay = pic.delays[f.min(pic.delays.len() - 1)];
+            let due = pic.due.get() + delay;
             // Late (it was covered): from now on.
-            pic.due.set(if due < now { now + pic.delays[f] } else { due });
+            pic.due.set(if due < now { now + delay } else { due });
             for s in &mut self.screens {
                 let global = s.global;
                 let Some(surf) = &mut s.surf else { continue };
@@ -551,6 +676,9 @@ impl State {
                         slot.surface.commit();
                     }
                 }
+            }
+            if let Some(p) = &pic.video {
+                p.ask_next(f);
             }
             soonest(pic.due.get());
         }
@@ -697,6 +825,20 @@ impl Dispatch<WlSurface, Option<u32>> for State {
         if surf.scale120 != 120 * factor.max(1) as u32 {
             surf.scale120 = 120 * factor.max(1) as u32;
             state.apply(i);
+        }
+    }
+}
+
+impl Dispatch<WlBuffer, VideoFrame> for State {
+    fn event(state: &mut Self, _: &WlBuffer, event: wayland_client::protocol::wl_buffer::Event, f: &VideoFrame, _: &Connection, _: &QueueHandle<Self>) {
+        if let wayland_client::protocol::wl_buffer::Event::Release = event {
+            for pic in state.shown_pics() {
+                if let Some(p) = pic.video.as_ref().filter(|p| p.id == f.id) {
+                    let mut r = p.released.get();
+                    r[f.slot] = true;
+                    p.released.set(r);
+                }
+            }
         }
     }
 }

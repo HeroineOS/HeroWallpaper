@@ -50,7 +50,7 @@ pub fn get(picture: &Path) -> Result<PathBuf, String> {
     if recorded_mtime(&thumb) == Some(mtime) {
         return Ok(thumb);
     }
-    let img = crate::picture::small(&picture, SIZE)?;
+    let img = if crate::video::is_video(&picture) { crate::video::still(&picture, SIZE)? } else { crate::picture::small(&picture, SIZE)? };
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     // Written whole, then moved into place (others may read the cache).
     let tmp = dir.join(format!(".herowallpaper-{}.png", std::process::id()));
