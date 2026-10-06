@@ -49,7 +49,11 @@ herowallpaper set PICTURE --mode contain      # cover, contain, stretch, center,
 herowallpaper set PICTURE --output HDMI-A-1   # one screen (names: herowallpaper --outputs)
 herowallpaper set --mode tile                 # just the mode
 herowallpaper set ""                          # no picture: the background color
+herowallpaper --running                       # exit status 0 if it's running
+herowallpaper thumbnail FILE...               # 256 px thumbnails (shared freedesktop cache)
 ```
+
+HeroAppearance's Wallpaper page does all of this with a gallery.
 
 `set` edits `~/.config/hero/wallpaper.toml` (keeping your comments), and the running
 wallpaper follows the file as soon as it's saved, whoever saves it.
@@ -77,7 +81,6 @@ better as videos, which are planned.
 
 - Videos (with hardware decoding), then streams and links.
 - Animated AVIF and JPEG XL.
-- A wallpaper page in HeroAppearance.
 
 ## Building
 

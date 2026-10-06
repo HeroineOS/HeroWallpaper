@@ -133,6 +133,24 @@ pub fn load(r: &Request) -> Result<Loaded, String> {
     Ok(Loaded { memory, size: f.buf, opaque, delays: vec![Duration::ZERO], dest: f.dest })
 }
 
+/// The picture (its first frame) shrunk to fit `max`×`max`, for a
+/// thumbnail: JPEGs decoded at a fraction of their size, as for screens.
+pub fn small(path: &Path, max: u32) -> Result<image::RgbaImage, String> {
+    let r = Request { path, mode: Mode::Contain, logical: (max as i32, max as i32), scale: 1.0, animate: false, budget: 0 };
+    let err = |e: &dyn std::fmt::Display| format!("{}: {e}", path.display());
+    let reader = image::ImageReader::new(BufReader::new(File::open(path).map_err(|e| err(&e))?)).with_guessed_format().map_err(|e| err(&e))?;
+    let img = if reader.format() == Some(image::ImageFormat::Jpeg) {
+        jpeg(&r).map_err(|e| err(&e))?
+    } else {
+        let mut d = reader.into_decoder().map_err(|e| err(&e))?;
+        let o = d.orientation().unwrap_or(image::metadata::Orientation::NoTransforms);
+        let mut img = DynamicImage::from_decoder(d).map_err(|e| err(&e))?;
+        img.apply_orientation(o);
+        img
+    };
+    Ok(if img.width() > max || img.height() > max { img.thumbnail(max, max) } else { img }.to_rgba8())
+}
+
 /// Every frame, if they fit the budget.
 fn animation(r: &Request, frames: image::Frames) -> Result<Option<Loaded>, image::ImageError> {
     let mut memory = memfd()?;

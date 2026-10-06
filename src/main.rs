@@ -12,6 +12,7 @@
 
 mod config;
 mod picture;
+mod thumb;
 mod watch;
 mod wl;
 
@@ -26,6 +27,8 @@ Usage:
   herowallpaper set PICTURE      show PICTURE (an image file; \"\" for none)
       [--mode cover|contain|stretch|center|tile] [--output NAME]
   herowallpaper --outputs        list the screens' names
+  herowallpaper --running        exit status 0 if running in this session
+  herowallpaper thumbnail FILE...  print a thumbnail of each (made if needed)
   herowallpaper --print-default-config
 
 Settings: ~/.config/hero/wallpaper.toml (applied when saved).",
@@ -58,13 +61,31 @@ fn main() {
             }
             return;
         }
+        Some("--running") => std::process::exit(if lock().is_none() { 0 } else { 1 }),
         Some("set") => return set(&args[1..]),
+        Some("thumbnail") => {
+            // One line each, in order: the thumbnail, or empty if it can't be made.
+            let mut failed = false;
+            for f in &args[1..] {
+                match thumb::get(std::path::Path::new(f)) {
+                    Ok(t) => println!("{}", t.display()),
+                    Err(e) => {
+                        eprintln!("herowallpaper: {e}");
+                        println!();
+                        failed = true;
+                    }
+                }
+            }
+            std::process::exit(failed as i32)
+        }
         Some(other) => fail(format!("unknown argument {other:?} (see --help)")),
     }
     let path = config::path().unwrap_or_else(|| fail("no home directory"));
-    if !single_instance() {
+    let Some(lock) = lock() else {
         fail("already running (change the picture with `herowallpaper set PICTURE`)");
-    }
+    };
+    // Held (locked) for as long as this runs.
+    let _lock = lock;
     wl::run(path).unwrap_or_else(|e| fail(e));
 }
 
@@ -105,8 +126,8 @@ fn set(args: &[String]) {
     }
 }
 
-/// Holds a lock in $XDG_RUNTIME_DIR for as long as this runs.
-fn single_instance() -> bool {
+/// The session's lock in $XDG_RUNTIME_DIR, if no wallpaper holds it.
+fn lock() -> Option<std::fs::File> {
     extern "C" {
         fn flock(fd: std::ffi::c_int, op: std::ffi::c_int) -> std::ffi::c_int;
     }
@@ -114,12 +135,7 @@ fn single_instance() -> bool {
     const LOCK_NB: std::ffi::c_int = 4;
     let dir = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
     let display = std::env::var("WAYLAND_DISPLAY").unwrap_or_default().replace('/', "_");
-    let Ok(f) = std::fs::File::create(dir.join(format!("herowallpaper-{display}.lock"))) else { return true };
+    let f = std::fs::File::create(dir.join(format!("herowallpaper-{display}.lock"))).ok()?;
     use std::os::fd::AsRawFd;
-    if unsafe { flock(f.as_raw_fd(), LOCK_EX | LOCK_NB) } != 0 {
-        return false;
-    }
-    // Kept open (and locked) until exit.
-    std::mem::forget(f);
-    true
+    (unsafe { flock(f.as_raw_fd(), LOCK_EX | LOCK_NB) } == 0).then_some(f)
 }

@@ -286,6 +286,8 @@ dependencies = [
  "fast_image_resize",
  "image",
  "jpeg-decoder",
+ "md5",
+ "png",
  "serde",
  "toml 0.9.12+spec-1.1.0",
  "toml_edit",
@@ -363,6 +365,12 @@ name = "log"
 version = "0.4.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
+
+[[package]]
+name = "md5"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "490cc448043f947bae3cbee9c203358d62dbee0db12107a74be5c30ccfd09771"
 
 [[package]]
 name = "memchr"
