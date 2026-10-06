@@ -1,0 +1,36 @@
+# HeroWallpaper: ~/.config/hero/wallpaper.toml
+# Changes apply as soon as the file is saved. `herowallpaper set PICTURE`
+# writes this file for you.
+
+# The picture: a still or animated image (JPEG, PNG and APNG, GIF, WebP,
+# AVIF, BMP, TIFF, QOI). Unset: just the background color.
+# path = "~/Pictures/wallpaper.jpg"
+
+# How it fills the screen:
+#   cover    fills it, cropping what overflows (default)
+#   contain  all of the picture, with bars of `color`
+#   stretch  fills it, out of proportion
+#   center   actual pixels, centered
+#   tile     repeated
+mode = "cover"
+
+# Behind contain/center and see-through pictures, and when there's no
+# picture. Unset: the theme's background, following it as it changes.
+# color = "#1e1e2e"
+
+# Crossfade when the picture changes, in ms (0: none). There's none while
+# the theme's animations are off.
+transition = 450
+
+# Animated pictures play (false: their first frame). They also hold still
+# while the theme's animations are off, as in battery saver.
+animate = true
+
+# The most memory, in MB, an animated picture's frames may take (one that
+# would need more shows its first frame).
+animation_memory = 256
+
+# Another picture on one screen (`herowallpaper --outputs` lists them):
+# [output."HDMI-A-1"]
+# path = "~/Pictures/other.png"
+# mode = "contain"

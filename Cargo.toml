@@ -1,0 +1,18 @@
+[package]
+name = "herowallpaper"
+version = "0.1.0"
+edition = "2021"
+description = "A lightweight wallpaper for Wayland: images and animated images, scaled and crossfaded by the compositor"
+license = "MIT"
+repository = "https://github.com/HeroineOS/HeroWallpaper"
+
+[dependencies]
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client", "staging"] }
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+image = { version = "0.25", default-features = false, features = ["png", "gif", "webp", "avif-native", "bmp", "qoi", "tiff"] }
+jpeg-decoder = { version = "0.3", default-features = false }
+fast_image_resize = "5"
+toml = { version = "0.9", default-features = false, features = ["parse", "serde", "std"] }
+toml_edit = { version = "0.23", default-features = false, features = ["parse", "display"] }
+serde = { version = "1", features = ["derive"] }
