@@ -202,6 +202,7 @@ pub fn run(config_path: PathBuf) -> Result<(), String> {
         eprintln!("herowallpaper: {e}");
         Config::default()
     });
+    one_arena();
     let (conn, mut queue, mut state) = connect(config)?;
     for (have, what) in [
         (state.g.layer_shell.is_some(), "wlr-layer-shell"),
@@ -444,6 +445,7 @@ impl State {
             frame: std::cell::Cell::new(0),
         });
         self.cache.push(Rc::downgrade(&pic));
+        trim();
         Ok(pic)
     }
 
@@ -553,6 +555,31 @@ impl State {
             soonest(pic.due.get());
         }
         next
+    }
+}
+
+/// Hands memory freed after decoding back to the system (glibc keeps it
+/// for reuse otherwise; there's no more decoding until the next change).
+fn trim() {
+    #[cfg(target_env = "gnu")]
+    {
+        extern "C" {
+            fn malloc_trim(pad: usize) -> std::ffi::c_int;
+        }
+        unsafe { malloc_trim(0) };
+    }
+}
+
+/// One malloc arena for every thread, so decoders' worker threads (AVIF)
+/// leave nothing behind in arenas of their own.
+pub fn one_arena() {
+    #[cfg(target_env = "gnu")]
+    {
+        extern "C" {
+            fn mallopt(param: std::ffi::c_int, value: std::ffi::c_int) -> std::ffi::c_int;
+        }
+        const M_ARENA_MAX: std::ffi::c_int = -8;
+        unsafe { mallopt(M_ARENA_MAX, 1) };
     }
 }
 

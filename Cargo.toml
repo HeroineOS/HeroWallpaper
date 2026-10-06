@@ -16,3 +16,28 @@ fast_image_resize = "5"
 toml = { version = "0.9", default-features = false, features = ["parse", "serde", "std"] }
 toml_edit = { version = "0.23", default-features = false, features = ["parse", "display"] }
 serde = { version = "1", features = ["derive"] }
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[package.metadata.deb]
+maintainer = "HeroineOS <https://github.com/HeroineOS>"
+copyright = "HeroineOS contributors"
+section = "x11"
+priority = "optional"
+depends = "$auto"
+extended-description = """\
+A lightweight wallpaper for Wayland compositors with wlr-layer-shell \
+(HeroWM, sway, Hyprland, KDE...): still and animated pictures (JPEG, PNG/APNG, \
+GIF, WebP, AVIF, BMP, TIFF, QOI), crossfades, a picture per screen. Scaling \
+and fading are left to the compositor, so it idles at well under a megabyte \
+of its own memory. Configured in ~/.config/hero/wallpaper.toml, or with \
+`herowallpaper set PICTURE`."""
+assets = [
+    ["target/release/herowallpaper", "usr/bin/", "755"],
+    ["README.md", "usr/share/doc/herowallpaper/README.md", "644"],
+    ["res/wallpaper.toml", "usr/share/doc/herowallpaper/examples/wallpaper.toml", "644"],
+]

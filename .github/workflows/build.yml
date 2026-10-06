@@ -1,0 +1,62 @@
+name: build
+
+# Builds and tests herowallpaper on x86_64 and arm64 in a Debian stable container
+# (packages built on stable also install on testing), and packages a .deb.
+# Pushing a tag v* creates a draft release with the .debs.
+#
+# The code also targets i686 and armv7; those aren't built here yet.
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: ${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: amd64, runner: ubuntu-24.04 }
+          - { arch: arm64, runner: ubuntu-24.04-arm }
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build, test and package
+        run: |
+          docker run --rm -v "$PWD":/src -w /src debian:trixie sh -euc '
+            apt-get update -qq
+            apt-get install -y -qq --no-install-recommends ca-certificates curl build-essential pkg-config dpkg-dev libdav1d-dev >/dev/null
+            curl -sSf https://sh.rustup.rs | sh -s -- -y -q --profile minimal
+            . "$HOME/.cargo/env"
+            cargo install -q cargo-deb --locked
+            cargo build --release --locked
+            cargo test --release --locked
+            cargo deb --no-build --locked
+            mkdir -p out && cp target/debian/*.deb out/
+            dpkg-deb -I out/*.deb | sed -n "/Package/,/Description/p"
+          '
+      - uses: actions/upload-artifact@v4
+        with:
+          name: herowallpaper-${{ matrix.arch }}
+          path: out/*.deb
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ls -l dist
+          gh release create "$GITHUB_REF_NAME" dist/*.deb --repo "$GITHUB_REPOSITORY" --draft \
+            --title "HeroWallpaper $GITHUB_REF_NAME" --notes "Test build. Install with: sudo apt install ./herowallpaper_*_<arch>.deb"
