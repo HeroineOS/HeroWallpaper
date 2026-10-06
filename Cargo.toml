@@ -1,6 +1,6 @@
 [package]
 name = "herowallpaper"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "A lightweight wallpaper for Wayland: images and animated images, scaled and crossfaded by the compositor"
 license = "MIT"
