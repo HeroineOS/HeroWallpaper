@@ -241,7 +241,7 @@ fn connect(config: Config) -> Result<Connected, String> {
 
 pub fn run(config_path: PathBuf) -> Result<(), String> {
     let config = Config::load(&config_path).unwrap_or_else(|e| {
-        eprintln!("herowallpaper: {e}");
+        crate::report(Some(&e));
         Config::default()
     });
     one_arena();
@@ -313,7 +313,7 @@ pub fn run(config_path: PathBuf) -> Result<(), String> {
                 if changed.contains(&0) {
                     match Config::load(&config_path) {
                         Ok(c) => state.config = c,
-                        Err(e) => eprintln!("herowallpaper: {e}"),
+                        Err(e) => crate::report(Some(&e)),
                     }
                 }
                 if changed.contains(&1) {
@@ -423,9 +423,12 @@ impl State {
             return;
         };
         let pic = match self.picture(&key, budget) {
-            Ok(p) => p,
+            Ok(p) => {
+                crate::report(None);
+                p
+            }
             Err(e) => {
-                eprintln!("herowallpaper: {e}");
+                crate::report(Some(&e));
                 return;
             }
         };

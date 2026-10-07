@@ -124,6 +124,25 @@ fn filter(fit: &Fit, rate: Option<f64>) -> String {
     f + ",format=bgr0"
 }
 
+/// Starts ffmpeg writing `fit`'s frames to its stdout.
+fn ffmpeg(path: &Path, fit: &Fit, rate: f64, moving: bool, hw: bool) -> std::io::Result<Child> {
+    let mut cmd = Command::new("ffmpeg");
+    // Two decoding threads: as fast here, and about 40 MB less than one per
+    // core.
+    cmd.args(["-nostdin", "-hide_banner", "-loglevel", "error", "-threads", "2", "-filter_threads", "1"]);
+    if hw {
+        cmd.args(["-hwaccel", "auto"]);
+    }
+    if moving {
+        cmd.args(["-stream_loop", "-1"]);
+    }
+    cmd.arg("-i").arg(path).args(["-an", "-sn", "-dn", "-vf", &filter(fit, moving.then_some(rate))]);
+    if !moving {
+        cmd.args(["-frames:v", "1"]);
+    }
+    cmd.args(["-f", "rawvideo", "pipe:1"]).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn()
+}
+
 impl Video {
     /// Starts playing; `done` gets `(id, slot)` each time a frame is in.
     /// Returns once the first frame is in slot 0.
@@ -132,37 +151,37 @@ impl Video {
         // Tiling a video makes no sense; it fills the screen instead.
         let mode = if mode == Mode::Tile { Mode::Cover } else { mode };
         let fit = picture::fit(mode, info.size, logical, scale);
-        let mut cmd = Command::new("ffmpeg");
-        // Two decoding threads: as fast here, and about 40 MB less than one per
-        // core. Hardware decoding where there is some.
-        cmd.args(["-nostdin", "-hide_banner", "-loglevel", "error", "-threads", "2", "-filter_threads", "1", "-hwaccel", "auto"]);
-        if moving {
-            cmd.args(["-stream_loop", "-1"]);
-        }
-        cmd.arg("-i").arg(path).args(["-an", "-sn", "-dn", "-vf", &filter(&fit, moving.then_some(info.rate))]);
-        if !moving {
-            cmd.args(["-frames:v", "1"]);
-        }
-        cmd.args(["-f", "rawvideo", "pipe:1"]).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null());
-        let mut child = cmd.spawn().map_err(|e| if e.kind() == std::io::ErrorKind::NotFound { "videos need FFmpeg (sudo apt install ffmpeg)".to_string() } else { e.to_string() })?;
         let frame = fit.buf.0 as usize * fit.buf.1 as usize * 4;
         let memory = picture::memfd().map_err(|e| e.to_string())?;
         memory.set_len((frame * SLOTS) as u64).map_err(|e| e.to_string())?;
         let map = Map::new(&memory, frame * SLOTS).map_err(|e| e.to_string())?;
-        let mut out = child.stdout.take().unwrap();
-        // A bigger pipe: fewer, larger reads per frame (up to the 1 MB
-        // allowed without privileges).
-        extern "C" {
-            fn fcntl(fd: std::ffi::c_int, cmd: std::ffi::c_int, ...) -> std::ffi::c_int;
-        }
-        const F_SETPIPE_SZ: std::ffi::c_int = 1031;
-        unsafe { fcntl(out.as_raw_fd(), F_SETPIPE_SZ, frame.min(1 << 20) as std::ffi::c_int) };
-        // The first frame, before anything is shown.
-        if let Err(e) = out.read_exact(map.slot(0, frame)) {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(format!("can't play it ({e})"));
-        }
+        // Hardware decoding first; if the first frame doesn't come that way
+        // (a decoder that fails on this video or this machine), software.
+        let mut tried = vec![];
+        let (child, mut out) = loop {
+            let hw = tried.is_empty();
+            let mut child = ffmpeg(path, &fit, info.rate, moving, hw).map_err(|e| if e.kind() == std::io::ErrorKind::NotFound { "videos need FFmpeg (sudo apt install ffmpeg)".to_string() } else { e.to_string() })?;
+            let mut out = child.stdout.take().unwrap();
+            // A bigger pipe: fewer, larger reads per frame (up to the 1 MB
+            // allowed without privileges).
+            extern "C" {
+                fn fcntl(fd: std::ffi::c_int, cmd: std::ffi::c_int, ...) -> std::ffi::c_int;
+            }
+            const F_SETPIPE_SZ: std::ffi::c_int = 1031;
+            unsafe { fcntl(out.as_raw_fd(), F_SETPIPE_SZ, frame.min(1 << 20) as std::ffi::c_int) };
+            // The first frame, before anything is shown.
+            match out.read_exact(map.slot(0, frame)) {
+                Ok(()) => break (child, out),
+                Err(e) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    tried.push(e.to_string());
+                    if !hw {
+                        return Err(format!("FFmpeg can't play it ({})", tried.join("; ")));
+                    }
+                }
+            }
+        };
         let (ask, asked) = mpsc::channel::<usize>();
         std::thread::Builder::new()
             .name("herowallpaper-video".into())

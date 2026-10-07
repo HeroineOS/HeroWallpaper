@@ -29,6 +29,7 @@ Usage:
       [--mode cover|contain|stretch|center|tile] [--output NAME]
   herowallpaper --outputs        list the screens' names
   herowallpaper --running        exit status 0 if running in this session
+  herowallpaper --status         whether it runs, which version, and what went wrong last
   herowallpaper thumbnail FILE...  print a thumbnail of each (made if needed)
   herowallpaper --print-default-config
   herowallpaper --version
@@ -65,6 +66,7 @@ fn main() {
             return;
         }
         Some("--running") => std::process::exit(if lock().is_none() { 0 } else { 1 }),
+        Some("--status") => status(),
         Some("set") => return set(&args[1..]),
         Some("thumbnail") => {
             // One line each, in order: the thumbnail, or empty if it can't be made.
@@ -84,10 +86,17 @@ fn main() {
         Some(other) => fail(format!("unknown argument {other:?} (see --help)")),
     }
     let path = config::path().unwrap_or_else(|| fail("no home directory"));
-    let Some(lock) = lock() else {
+    let Some(mut lock) = lock() else {
         fail("already running (change the picture with `herowallpaper set PICTURE`)");
     };
-    // Held (locked) for as long as this runs.
+    // Held (locked) for as long as this runs; says who holds it.
+    {
+        use std::io::{Seek, Write};
+        let _ = lock.set_len(0);
+        let _ = lock.rewind();
+        let _ = writeln!(lock, "{} {}", std::process::id(), env!("CARGO_PKG_VERSION"));
+    }
+    report(None);
     let _lock = lock;
     wl::run(path).unwrap_or_else(|e| fail(e));
 }
@@ -129,6 +138,40 @@ fn set(args: &[String]) {
     }
 }
 
+/// A file of this session's wallpaper in $XDG_RUNTIME_DIR.
+fn runtime_file(ext: &str) -> PathBuf {
+    let dir = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
+    let display = std::env::var("WAYLAND_DISPLAY").unwrap_or_default().replace('/', "_");
+    dir.join(format!("herowallpaper-{display}.{ext}"))
+}
+
+/// Records what went wrong last (None: nothing now), for `--status` and
+/// settings apps, as well as on stderr.
+pub fn report(problem: Option<&str>) {
+    if let Some(p) = problem {
+        eprintln!("herowallpaper: {p}");
+    }
+    let _ = std::fs::write(runtime_file("status"), problem.unwrap_or(""));
+}
+
+/// `--status`: "running VERSION PID" (and the last problem on the next
+/// line) or "not running".
+fn status() -> ! {
+    if lock().is_some() {
+        println!("not running");
+        std::process::exit(1);
+    }
+    let who = std::fs::read_to_string(runtime_file("lock")).unwrap_or_default();
+    let mut w = who.split_whitespace();
+    let (pid, version) = (w.next().unwrap_or("?"), w.next().unwrap_or("?"));
+    println!("running {version} {pid}");
+    let problem = std::fs::read_to_string(runtime_file("status")).unwrap_or_default();
+    if !problem.trim().is_empty() {
+        println!("{}", problem.trim());
+    }
+    std::process::exit(0)
+}
+
 /// The session's lock in $XDG_RUNTIME_DIR, if no wallpaper holds it.
 fn lock() -> Option<std::fs::File> {
     extern "C" {
@@ -136,9 +179,8 @@ fn lock() -> Option<std::fs::File> {
     }
     const LOCK_EX: std::ffi::c_int = 2;
     const LOCK_NB: std::ffi::c_int = 4;
-    let dir = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
-    let display = std::env::var("WAYLAND_DISPLAY").unwrap_or_default().replace('/', "_");
-    let f = std::fs::File::create(dir.join(format!("herowallpaper-{display}.lock"))).ok()?;
+    // Not truncated: the running wallpaper's pid and version are in it.
+    let f = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(runtime_file("lock")).ok()?;
     use std::os::fd::AsRawFd;
     (unsafe { flock(f.as_raw_fd(), LOCK_EX | LOCK_NB) } == 0).then_some(f)
 }
