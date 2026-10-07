@@ -21,7 +21,7 @@ use std::path::PathBuf;
 
 fn usage() -> ! {
     println!(
-        "herowallpaper {}
+        "herowallpaper {} - the HeroineOS wallpaper (pictures, animations, videos)
 
 Usage:
   herowallpaper                  run (one per session)
@@ -31,6 +31,8 @@ Usage:
   herowallpaper --running        exit status 0 if running in this session
   herowallpaper thumbnail FILE...  print a thumbnail of each (made if needed)
   herowallpaper --print-default-config
+  herowallpaper --version
+  herowallpaper --help
 
 Settings: ~/.config/hero/wallpaper.toml (applied when saved).",
         env!("CARGO_PKG_VERSION")
