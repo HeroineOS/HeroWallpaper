@@ -11,6 +11,7 @@
 //! is due (and only while the compositor shows it).
 
 mod config;
+mod gpu;
 mod picture;
 mod thumb;
 mod video;
@@ -35,7 +36,11 @@ Usage:
   herowallpaper --version
   herowallpaper --help
 
-Settings: ~/.config/hero/wallpaper.toml (applied when saved).",
+Settings: ~/.config/hero/wallpaper.toml (applied when saved).
+
+Environment:
+  HEROWALLPAPER_NO_GPU=1         videos through shared memory, not GPU buffers
+  HEROWALLPAPER_DEBUG=1          print how videos are decoded and shown",
         env!("CARGO_PKG_VERSION")
     );
     std::process::exit(0)
@@ -97,6 +102,7 @@ fn main() {
         let _ = writeln!(lock, "{} {}", std::process::id(), env!("CARGO_PKG_VERSION"));
     }
     report(None);
+    let _ = std::fs::remove_file(runtime_file("video"));
     let _lock = lock;
     wl::run(path).unwrap_or_else(|e| fail(e));
 }
@@ -154,8 +160,16 @@ pub fn report(problem: Option<&str>) {
     let _ = std::fs::write(runtime_file("status"), problem.unwrap_or(""));
 }
 
-/// `--status`: "running VERSION PID" (and the last problem on the next
-/// line) or "not running".
+/// Says how videos play, for `--status`.
+pub fn videos_play(how: &str) {
+    if std::env::var_os("HEROWALLPAPER_DEBUG").is_some() {
+        eprintln!("herowallpaper: videos play {how}");
+    }
+    let _ = std::fs::write(runtime_file("video"), how);
+}
+
+/// `--status`: "running VERSION PID" (then how videos play, once one has)
+/// and the last problem on the next line; or "not running".
 fn status() -> ! {
     if lock().is_some() {
         println!("not running");
@@ -164,7 +178,12 @@ fn status() -> ! {
     let who = std::fs::read_to_string(runtime_file("lock")).unwrap_or_default();
     let mut w = who.split_whitespace();
     let (pid, version) = (w.next().unwrap_or("?"), w.next().unwrap_or("?"));
-    println!("running {version} {pid}");
+    let video = std::fs::read_to_string(runtime_file("video")).unwrap_or_default();
+    if video.is_empty() {
+        println!("running {version} {pid}");
+    } else {
+        println!("running {version} {pid} - videos play {video}");
+    }
     let problem = std::fs::read_to_string(runtime_file("status")).unwrap_or_default();
     if !problem.trim().is_empty() {
         println!("{}", problem.trim());

@@ -23,6 +23,8 @@ use wayland_protocols::wp::alpha_modifier::v1::client::wp_alpha_modifier_surface
 use wayland_protocols::wp::alpha_modifier::v1::client::wp_alpha_modifier_v1::WpAlphaModifierV1;
 use wayland_protocols::wp::fractional_scale::v1::client::wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1;
 use wayland_protocols::wp::fractional_scale::v1::client::wp_fractional_scale_v1::{self, WpFractionalScaleV1};
+use wayland_protocols::wp::linux_dmabuf::zv1::client::zwp_linux_buffer_params_v1::{self, ZwpLinuxBufferParamsV1};
+use wayland_protocols::wp::linux_dmabuf::zv1::client::zwp_linux_dmabuf_v1::{self, ZwpLinuxDmabufV1};
 use wayland_protocols::wp::single_pixel_buffer::v1::client::wp_single_pixel_buffer_manager_v1::WpSinglePixelBufferManagerV1;
 use wayland_protocols::wp::viewporter::client::wp_viewport::WpViewport;
 use wayland_protocols::wp::viewporter::client::wp_viewporter::WpViewporter;
@@ -31,7 +33,8 @@ use wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_surface_v1::{self
 
 use crate::config::{Config, Mode, Theme};
 use crate::picture;
-use crate::video::{self, Video, SLOTS};
+use crate::gpu::{self, Gbm};
+use crate::video::{self, Frames, Video, SLOTS};
 
 #[derive(Default)]
 struct Globals {
@@ -43,6 +46,9 @@ struct Globals {
     pixel: Option<WpSinglePixelBufferManagerV1>,
     alpha: Option<WpAlphaModifierV1>,
     fractional: Option<WpFractionalScaleManagerV1>,
+    dmabuf: Option<ZwpLinuxDmabufV1>,
+    /// The modifiers NV12 GPU buffers can have.
+    nv12: Vec<u64>,
 }
 
 /// What a picture was loaded for: the same key, the same pixels (screens
@@ -54,12 +60,14 @@ struct Key {
     logical: (i32, i32),
     scale120: u32,
     animate: bool,
+    /// A video in GPU buffers.
+    gpu: bool,
 }
 
 /// A loaded picture: its frames in one shared memory pool.
 struct Pic {
     key: Key,
-    pool: WlShmPool,
+    pool: Option<WlShmPool>,
     buffers: Vec<WlBuffer>,
     delays: Vec<Duration>,
     dest: (i32, i32, i32, i32),
@@ -108,7 +116,9 @@ impl Drop for Pic {
         for b in &self.buffers {
             b.destroy();
         }
-        self.pool.destroy();
+        if let Some(p) = &self.pool {
+            p.destroy();
+        }
     }
 }
 
@@ -216,6 +226,18 @@ pub struct State {
     frames_in: std::os::unix::net::UnixStream,
     frames_out: std::os::unix::net::UnixStream,
     next_video: u32,
+    /// GPU buffers for videos.
+    gpu: Gpu,
+}
+
+/// Whether videos go to the GPU (NV12 dmabufs), and with what.
+enum Gpu {
+    Untried,
+    /// The compositor is being asked; the test frame.
+    Probing(Rc<Gbm>, u64, #[allow(dead_code)] gpu::Frame),
+    /// GBM and the modifier.
+    Yes(Rc<Gbm>, u64),
+    No,
 }
 
 /// The screens' names.
@@ -234,7 +256,7 @@ fn connect(config: Config) -> Result<Connected, String> {
     conn.display().get_registry(&qh, ());
     let (frames_in, frames_out) = std::os::unix::net::UnixStream::pair().map_err(|e| e.to_string())?;
     frames_in.set_nonblocking(true).map_err(|e| e.to_string())?;
-    let mut state = State { g: Globals::default(), screens: vec![], config, theme: Theme::load(), cache: vec![], qh, frames_in, frames_out, next_video: 0 };
+    let mut state = State { g: Globals::default(), screens: vec![], config, theme: Theme::load(), cache: vec![], qh, frames_in, frames_out, next_video: 0, gpu: Gpu::Untried };
     queue.roundtrip(&mut state).map_err(|e| e.to_string())?;
     Ok((conn, queue, state))
 }
@@ -410,8 +432,14 @@ impl State {
         }
         let shown = self.config.for_output(s.name.as_deref().unwrap_or(""));
         self.set_background(i, shown.color.unwrap_or(self.theme.background));
+        let video = shown.path.as_deref().is_some_and(video::is_video);
+        if video && !self.gpu_known() {
+            // Shown once the compositor says about GPU buffers.
+            return;
+        }
+        let gpu = video && matches!(self.gpu, Gpu::Yes(..));
         let surf = self.screens[i].surf.as_ref().unwrap();
-        let want = shown.path.map(|path| Key { path, mode: shown.mode, logical: surf.logical, scale120: surf.scale120, animate });
+        let want = shown.path.map(|path| Key { path, mode: shown.mode, logical: surf.logical, scale120: surf.scale120, animate, gpu });
         let have = surf.slots[surf.top].pic.as_ref().map(|p| &p.key);
         if want.as_ref() == have {
             return;
@@ -488,7 +516,7 @@ impl State {
         let buffers = (0..loaded.delays.len()).map(|f| pool.create_buffer((f * bytes) as i32, w, h, w * 4, format, &self.qh, ())).collect();
         let pic = Rc::new(Pic {
             key: key.clone(),
-            pool,
+            pool: Some(pool),
             buffers,
             due: std::cell::Cell::new(Instant::now() + loaded.delays[0]),
             delays: loaded.delays,
@@ -507,12 +535,39 @@ impl State {
         let id = self.next_video;
         self.next_video += 1;
         let out = self.frames_out.try_clone().map_err(|e| e.to_string())?;
-        let v = Video::start(&key.path, key.mode, key.logical, key.scale120 as f64 / 120.0, key.animate, id, out).map_err(|e| format!("{}: {e}", key.path.display()))?;
-        let bytes = v.size.0 as usize * v.size.1 as usize * 4;
-        let total = i32::try_from(bytes * SLOTS).map_err(|_| "too large".to_string())?;
-        let pool = self.g.shm.as_ref().unwrap().create_pool(v.memory.as_fd(), total, &self.qh, ());
+        let gpu = match &self.gpu {
+            Gpu::Yes(g, m) if key.gpu => Some((g.clone(), *m)),
+            _ => None,
+        };
+        let v = Video::start(&key.path, key.mode, key.logical, key.scale120 as f64 / 120.0, key.animate, (id, out), gpu.as_ref().map(|(g, _)| &**g)).map_err(|e| format!("{}: {e}", key.path.display()))?;
         let (w, h) = (v.size.0 as i32, v.size.1 as i32);
-        let buffers = (0..SLOTS).map(|slot| pool.create_buffer((slot * bytes) as i32, w, h, w * 4, wl_shm::Format::Xrgb8888, &self.qh, VideoFrame { id, slot })).collect();
+        let (pool, buffers) = match &v.frames {
+            Frames::Shm(memory) => {
+                let bytes = v.size.0 as usize * v.size.1 as usize * 4;
+                let total = i32::try_from(bytes * SLOTS).map_err(|_| "too large".to_string())?;
+                let pool = self.g.shm.as_ref().unwrap().create_pool(memory.as_fd(), total, &self.qh, ());
+                let buffers = (0..SLOTS).map(|slot| pool.create_buffer((slot * bytes) as i32, w, h, w * 4, wl_shm::Format::Xrgb8888, &self.qh, VideoFrame { id, slot })).collect();
+                (Some(pool), buffers)
+            }
+            Frames::Gpu(frames) => {
+                let modifier = gpu.map_or(gpu::MOD_LINEAR, |(_, m)| m);
+                let dmabuf = self.g.dmabuf.as_ref().unwrap();
+                let buffers = frames
+                    .iter()
+                    .enumerate()
+                    .map(|(slot, f)| {
+                        let params = dmabuf.create_params(&self.qh, false);
+                        let (hi, lo) = ((modifier >> 32) as u32, modifier as u32);
+                        params.add(f.fd.as_fd(), 0, 0, f.stride, hi, lo);
+                        params.add(f.fd.as_fd(), 1, f.uv_offset, f.stride, hi, lo);
+                        let b = params.create_immed(w, h, gpu::NV12, zwp_linux_buffer_params_v1::Flags::empty(), &self.qh, VideoFrame { id, slot });
+                        params.destroy();
+                        b
+                    })
+                    .collect();
+                (None, buffers)
+            }
+        };
         let playing = Playing { id, released: std::cell::Cell::new([false, true, true]), ready: std::cell::Cell::new(None), asked: std::cell::Cell::new(false), video: v };
         // The second frame on its way already.
         playing.ask_next(0);
@@ -529,6 +584,36 @@ impl State {
         });
         self.cache.push(Rc::downgrade(&pic));
         Ok(pic)
+    }
+
+    /// Whether a video can start, starting the GPU buffer test first: a
+    /// small buffer the compositor answers about (a failed real one would
+    /// end the connection). The video starts when it has.
+    fn gpu_known(&mut self) -> bool {
+        if let Gpu::Untried = self.gpu {
+            self.gpu = self.probe().unwrap_or(Gpu::No);
+        }
+        !matches!(self.gpu, Gpu::Probing(..))
+    }
+
+    fn probe(&self) -> Option<Gpu> {
+        let no = |why: &str| {
+            crate::videos_play(&format!("through shared memory ({why})"));
+            None
+        };
+        if std::env::var_os("HEROWALLPAPER_NO_GPU").is_some() {
+            return no("HEROWALLPAPER_NO_GPU is set");
+        }
+        let Some(dmabuf) = self.g.dmabuf.as_ref() else { return no("the compositor takes no GPU buffers") };
+        let Some(modifier) = [gpu::MOD_LINEAR, gpu::MOD_INVALID].into_iter().find(|m| self.g.nv12.contains(m)) else { return no("the compositor takes no NV12 GPU buffers") };
+        let Some(gbm) = Gbm::open(None) else { return no("no GBM: libgbm1 or a GPU driver for it is missing") };
+        let frame = gbm.nv12(64, 64)?;
+        let params = dmabuf.create_params(&self.qh, true);
+        let (hi, lo) = ((modifier >> 32) as u32, modifier as u32);
+        params.add(frame.fd.as_fd(), 0, 0, frame.stride, hi, lo);
+        params.add(frame.fd.as_fd(), 1, frame.uv_offset(), frame.stride, hi, lo);
+        params.create(64, 64, gpu::NV12, zwp_linux_buffer_params_v1::Flags::empty());
+        Some(Gpu::Probing(Rc::new(gbm), modifier, frame))
     }
 
     /// Every picture showing somewhere (each once).
@@ -728,6 +813,8 @@ impl Dispatch<WlRegistry, ()> for State {
                     "wp_single_pixel_buffer_manager_v1" => g.pixel = Some(registry.bind(name, 1, qh, ())),
                     "wp_alpha_modifier_v1" => g.alpha = Some(registry.bind(name, 1, qh, ())),
                     "wp_fractional_scale_manager_v1" => g.fractional = Some(registry.bind(name, 1, qh, ())),
+                    // Version 3 lists formats and modifiers right away.
+                    "zwp_linux_dmabuf_v1" if version >= 3 => g.dmabuf = Some(registry.bind(name, 3, qh, ())),
                     "wl_output" => {
                         let output = registry.bind(name, version.min(4), qh, name);
                         state.screens.push(Screen { global: name, output, name: None, scale: 1, ready: false, surf: None });
@@ -844,6 +931,49 @@ impl Dispatch<WlBuffer, VideoFrame> for State {
             }
         }
     }
+}
+
+impl Dispatch<ZwpLinuxDmabufV1, ()> for State {
+    fn event(state: &mut Self, _: &ZwpLinuxDmabufV1, event: zwp_linux_dmabuf_v1::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
+        match event {
+            zwp_linux_dmabuf_v1::Event::Modifier { format, modifier_hi, modifier_lo } if format == gpu::NV12 => state.g.nv12.push((modifier_hi as u64) << 32 | modifier_lo as u64),
+            // Version 1 and 2: implicit modifiers only.
+            zwp_linux_dmabuf_v1::Event::Format { format } if format == gpu::NV12 => state.g.nv12.push(gpu::MOD_INVALID),
+            _ => {}
+        }
+    }
+}
+
+/// `true` for the test buffer.
+impl Dispatch<ZwpLinuxBufferParamsV1, bool> for State {
+    fn event(state: &mut Self, params: &ZwpLinuxBufferParamsV1, event: zwp_linux_buffer_params_v1::Event, test: &bool, _: &Connection, _: &QueueHandle<Self>) {
+        let ok = match event {
+            zwp_linux_buffer_params_v1::Event::Created { buffer } => {
+                buffer.destroy();
+                true
+            }
+            zwp_linux_buffer_params_v1::Event::Failed => false,
+            _ => return,
+        };
+        if *test {
+            params.destroy();
+        }
+        let was = std::mem::replace(&mut state.gpu, Gpu::No);
+        if ok {
+            if let Gpu::Probing(gbm, modifier, _) = was {
+                state.gpu = Gpu::Yes(gbm, modifier);
+                crate::videos_play("in GPU memory (NV12)");
+            }
+        } else {
+            crate::videos_play("through shared memory (the compositor turned down NV12 GPU buffers)");
+        }
+        // Videos waiting start; ones in GPU buffers that failed restart.
+        state.apply_all();
+    }
+
+    wayland_client::event_created_child!(State, ZwpLinuxBufferParamsV1, [
+        zwp_linux_buffer_params_v1::EVT_CREATED_OPCODE => (WlBuffer, ()),
+    ]);
 }
 
 impl Dispatch<WlCallback, (u32, usize)> for State {

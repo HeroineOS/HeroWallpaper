@@ -1,6 +1,6 @@
 [package]
 name = "herowallpaper"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2021"
 description = "A lightweight wallpaper for Wayland: images and animated images, scaled and crossfaded by the compositor"
 license = "MIT"
@@ -32,7 +32,7 @@ section = "x11"
 priority = "optional"
 depends = "$auto"
 # Videos play through the ffmpeg command.
-recommends = "ffmpeg"
+recommends = "ffmpeg, libgbm1"
 extended-description = """\
 A lightweight wallpaper for Wayland compositors with wlr-layer-shell \
 (HeroWM, sway, Hyprland, KDE...): still and animated pictures (JPEG, PNG/APNG, \
