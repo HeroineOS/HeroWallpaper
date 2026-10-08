@@ -105,6 +105,138 @@ pub fn still(path: &Path, max: u32) -> Result<image::RgbaImage, String> {
     image::RgbaImage::from_raw(w, h, px).ok_or_else(|| "bad frame".to_string())
 }
 
+/// Whether playing `info` on the screen as `fit` wastes most of the
+/// decoding: a video much bigger than the screen shows (a 4K one on a
+/// laptop) or faster than screens go.
+fn needs_fitting(info: &Info, fit: &Fit) -> bool {
+    let (_, _, cw, ch) = fit.crop;
+    cw > fit.buf.0 as f64 * 1.25 || ch > fit.buf.1 as f64 * 1.25 || info.rate > 61.0
+}
+
+/// Where copies of videos fitted to screens are kept.
+fn fitted_dir() -> Option<std::path::PathBuf> {
+    std::env::var_os("XDG_CACHE_HOME")
+        .map(std::path::PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".cache")))
+        .map(|c| c.join("herowallpaper"))
+}
+
+/// The fitted copy's name: the video (path, size, time) and the fit.
+fn fitted_name(path: &Path, fit: &Fit) -> String {
+    let meta = std::fs::metadata(path).ok();
+    let time = meta.as_ref().and_then(|m| m.modified().ok()).and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |d| d.as_secs());
+    let key = format!("{}\0{}\0{}\0{:?}\0{:?}", path.display(), meta.map_or(0, |m| m.len()), time, fit.crop, fit.buf);
+    format!("{:x}.mkv", md5::compute(key.as_bytes()))
+}
+
+/// The ffmpeg filter for a fitted copy: the screen's pixels (even, for
+/// YUV 4:2:0), at most 60 frames a second.
+fn fitted_filter(info: &Info, fit: &Fit) -> String {
+    let (x, y, w, h) = fit.crop;
+    let even = |v: u32| v.div_ceil(2) * 2;
+    let mut f = format!("crop={}:{}:{}:{},scale={}:{}:flags=area", w.round(), h.round(), x.round(), y.round(), even(fit.buf.0), even(fit.buf.1));
+    if info.rate > 61.0 {
+        f = format!("fps=60,{f}");
+    }
+    f
+}
+
+/// Making a fitted copy, in the background at the lowest priority; it
+/// stops (and leaves nothing) when dropped.
+pub struct Preparing {
+    child: std::sync::Arc<std::sync::Mutex<Option<Child>>>,
+    cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Drop for Preparing {
+    fn drop(&mut self) {
+        self.cancelled.store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(c) = self.child.lock().unwrap().as_mut() {
+            let _ = c.kill();
+        }
+    }
+}
+
+/// Starts making `copy` from `path`; `done` gets `(id, u32::MAX)` when it's
+/// there.
+fn prepare(path: &Path, copy: &Path, filter: String, (id, done): (u32, std::os::unix::net::UnixStream)) -> std::io::Result<Preparing> {
+    let dir = copy.parent().unwrap().to_path_buf();
+    std::fs::create_dir_all(&dir)?;
+    let part = copy.with_extension("part");
+    let (path, copy) = (path.to_path_buf(), copy.to_path_buf());
+    let child: std::sync::Arc<std::sync::Mutex<Option<Child>>> = Default::default();
+    let cancelled: std::sync::Arc<std::sync::atomic::AtomicBool> = Default::default();
+    let (c, stop) = (child.clone(), cancelled.clone());
+    std::thread::Builder::new().name("herowallpaper-fit".into()).stack_size(64 * 1024).spawn(move || {
+        let _ = std::fs::write(crate::runtime_file("preparing"), path.display().to_string());
+        // H.264 made quick to decode; else MPEG-4 (FFmpeg's own).
+        let encoders: [&[&str]; 2] = [&["-c:v", "libx264", "-preset", "veryfast", "-tune", "fastdecode", "-crf", "20", "-g", "120"], &["-c:v", "mpeg4", "-q:v", "3"]];
+        let mut ok = false;
+        for enc in encoders {
+            let mut cmd = Command::new("ffmpeg");
+            cmd.args(["-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-threads", "2", "-i"]).arg(&path);
+            cmd.args(["-an", "-sn", "-dn", "-vf", &filter, "-threads", "2", "-pix_fmt", "yuv420p"]).args(enc).args(["-f", "matroska"]).arg(&part);
+            cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+            {
+                use std::os::unix::process::CommandExt;
+                // The lowest priority: whatever else runs comes first.
+                unsafe {
+                    cmd.pre_exec(|| {
+                        extern "C" {
+                            fn setpriority(which: std::ffi::c_int, who: std::ffi::c_uint, prio: std::ffi::c_int) -> std::ffi::c_int;
+                        }
+                        setpriority(0, 0, 19);
+                        Ok(())
+                    })
+                };
+            }
+            let Ok(started) = cmd.spawn() else { break };
+            *c.lock().unwrap() = Some(started);
+            let status = loop {
+                if let Some(st) = c.lock().unwrap().as_mut().and_then(|ch| ch.try_wait().ok().flatten()) {
+                    break st;
+                }
+                std::thread::sleep(Duration::from_millis(300));
+            };
+            *c.lock().unwrap() = None;
+            if stop.load(std::sync::atomic::Ordering::SeqCst) {
+                break;
+            }
+            if status.success() {
+                ok = std::fs::rename(&part, &copy).is_ok();
+                break;
+            }
+        }
+        let _ = std::fs::remove_file(&part);
+        let _ = std::fs::remove_file(crate::runtime_file("preparing"));
+        if ok {
+            prune(&dir);
+            let mut msg = [0u8; 8];
+            msg[..4].copy_from_slice(&id.to_ne_bytes());
+            msg[4..].copy_from_slice(&u32::MAX.to_ne_bytes());
+            use std::io::Write;
+            let _ = (&done).write_all(&msg);
+        }
+    })?;
+    Ok(Preparing { child, cancelled })
+}
+
+/// Keeps the fitted copies used last (each use touches its time).
+fn prune(dir: &Path) {
+    const KEEP: usize = 6;
+    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    let mut copies: Vec<(std::time::SystemTime, std::path::PathBuf)> = rd
+        .flatten()
+        .filter(|e| e.path().extension().is_some_and(|x| x == "mkv"))
+        .filter_map(|e| Some((e.metadata().ok()?.modified().ok()?, e.path())))
+        .collect();
+    copies.sort_by(|a, b| b.0.cmp(&a.0));
+    for (_, p) in copies.into_iter().skip(KEEP) {
+        let _ = std::fs::remove_file(p);
+    }
+}
+
 /// A video playing into `SLOTS` frames.
 pub struct Video {
     child: Child,
@@ -116,6 +248,9 @@ pub struct Video {
     pub interval: Duration,
     /// Plays (else its first frame stays).
     pub moving: bool,
+    /// A copy fitted to the screen on its way; the first frame shows
+    /// meanwhile.
+    _preparing: Option<Preparing>,
 }
 
 /// The ffmpeg filter for `fit`: crop, scale, frame rate, pixel format.
@@ -249,11 +384,36 @@ impl Target {
 impl Video {
     /// Starts playing; `done` gets `(id, slot)` each time a frame is in.
     /// Returns once the first frame is in slot 0.
-    pub fn start(path: &Path, mode: Mode, logical: (i32, i32), scale: f64, moving: bool, (id, done): (u32, std::os::unix::net::UnixStream), gpu: Option<&crate::gpu::Gbm>) -> Result<Video, String> {
-        let info = probe(path)?;
+    pub fn start(path: &Path, mode: Mode, logical: (i32, i32), scale: f64, mut moving: bool, (id, done): (u32, std::os::unix::net::UnixStream), gpu: Option<&crate::gpu::Gbm>) -> Result<Video, String> {
+        let mut info = probe(path)?;
         // Tiling a video makes no sense; it fills the screen instead.
         let mode = if mode == Mode::Tile { Mode::Cover } else { mode };
-        let fit = picture::fit(mode, info.size, logical, scale);
+        let mut fit = picture::fit(mode, info.size, logical, scale);
+        // Far more pixels or frames than the screen shows: a copy fitted to
+        // it, made once (decoding a 4K video for a laptop screen takes
+        // several times the CPU).
+        let mut preparing = None;
+        let mut path = path.to_path_buf();
+        if moving && needs_fitting(&info, &fit) {
+            if let Some(copy) = fitted_dir().map(|d| d.join(fitted_name(&path, &fit))) {
+                let ready = std::fs::File::options().write(true).open(&copy).and_then(|f| f.set_modified(std::time::SystemTime::now())).is_ok();
+                match ready.then(|| probe(&copy)) {
+                    Some(Ok(i)) => {
+                        fit = picture::fit(mode, i.size, logical, scale);
+                        info = i;
+                        path = copy;
+                    }
+                    _ => {
+                        let _ = std::fs::remove_file(&copy);
+                        if let Ok(p) = prepare(&path, &copy, fitted_filter(&info, &fit), (id, done.try_clone().map_err(|e| e.to_string())?)) {
+                            preparing = Some(p);
+                            moving = false;
+                        }
+                    }
+                }
+            }
+        }
+        let path = path.as_path();
         let rate = moving.then_some(info.rate);
         // GPU buffers if they can be made at this size, else shared memory.
         let gpu = gpu.and_then(|g| {
@@ -331,7 +491,7 @@ impl Video {
                 }
             })
             .map_err(|e| e.to_string())?;
-        Ok(Video { child, ask: Some(ask), frames, size, dest: fit.dest, interval: Duration::from_secs_f64(1.0 / info.rate), moving })
+        Ok(Video { _preparing: preparing, child, ask: Some(ask), frames, size, dest: fit.dest, interval: Duration::from_secs_f64(1.0 / info.rate), moving })
     }
 
     /// Reads the next frame into `slot` (`done` says when it's in).

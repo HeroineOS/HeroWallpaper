@@ -103,6 +103,7 @@ fn main() {
     }
     report(None);
     let _ = std::fs::remove_file(runtime_file("video"));
+    let _ = std::fs::remove_file(runtime_file("preparing"));
     let _lock = lock;
     wl::run(path).unwrap_or_else(|e| fail(e));
 }
@@ -145,7 +146,7 @@ fn set(args: &[String]) {
 }
 
 /// A file of this session's wallpaper in $XDG_RUNTIME_DIR.
-fn runtime_file(ext: &str) -> PathBuf {
+pub fn runtime_file(ext: &str) -> PathBuf {
     let dir = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
     let display = std::env::var("WAYLAND_DISPLAY").unwrap_or_default().replace('/', "_");
     dir.join(format!("herowallpaper-{display}.{ext}"))
@@ -168,8 +169,9 @@ pub fn videos_play(how: &str) {
     let _ = std::fs::write(runtime_file("video"), how);
 }
 
-/// `--status`: "running VERSION PID" (then how videos play, once one has)
-/// and the last problem on the next line; or "not running".
+/// `--status`: "running VERSION PID" (then how videos play, once one has,
+/// and a fitted copy being made) and the last problem on the next line;
+/// or "not running".
 fn status() -> ! {
     if lock().is_some() {
         println!("not running");
@@ -178,12 +180,15 @@ fn status() -> ! {
     let who = std::fs::read_to_string(runtime_file("lock")).unwrap_or_default();
     let mut w = who.split_whitespace();
     let (pid, version) = (w.next().unwrap_or("?"), w.next().unwrap_or("?"));
+    let mut line = format!("running {version} {pid}");
     let video = std::fs::read_to_string(runtime_file("video")).unwrap_or_default();
-    if video.is_empty() {
-        println!("running {version} {pid}");
-    } else {
-        println!("running {version} {pid} - videos play {video}");
+    if !video.is_empty() {
+        line += &format!(" - videos play {video}");
     }
+    if let Ok(p) = std::fs::read_to_string(runtime_file("preparing")) {
+        line += &format!(" - preparing a copy of {p} fitted to the screen (once; a still until then)");
+    }
+    println!("{line}");
     let problem = std::fs::read_to_string(runtime_file("status")).unwrap_or_default();
     if !problem.trim().is_empty() {
         println!("{}", problem.trim());

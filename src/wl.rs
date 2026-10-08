@@ -76,6 +76,8 @@ struct Pic {
     due: std::cell::Cell<Instant>,
     /// A video: its frames go through `buffers` (one per slot).
     video: Option<Playing>,
+    /// To be loaded again (a video's fitted copy is ready).
+    stale: std::cell::Cell<bool>,
 }
 
 /// A video's frames in flight.
@@ -440,7 +442,7 @@ impl State {
         let gpu = video && matches!(self.gpu, Gpu::Yes(..));
         let surf = self.screens[i].surf.as_ref().unwrap();
         let want = shown.path.map(|path| Key { path, mode: shown.mode, logical: surf.logical, scale120: surf.scale120, animate, gpu });
-        let have = surf.slots[surf.top].pic.as_ref().map(|p| &p.key);
+        let have = surf.slots[surf.top].pic.as_ref().filter(|p| !p.stale.get()).map(|p| &p.key);
         if want.as_ref() == have {
             return;
         }
@@ -492,7 +494,7 @@ impl State {
 
     /// Loaded already for another screen, or loads it.
     fn picture(&mut self, key: &Key, budget: usize) -> Result<Rc<Pic>, String> {
-        self.cache.retain(|w| w.strong_count() > 0);
+        self.cache.retain(|w| w.upgrade().is_some_and(|p| !p.stale.get()));
         if let Some(p) = self.cache.iter().filter_map(Weak::upgrade).find(|p| &p.key == key) {
             return Ok(p);
         }
@@ -524,6 +526,7 @@ impl State {
             opaque: loaded.opaque,
             frame: std::cell::Cell::new(0),
             video: None,
+            stale: Default::default(),
         });
         self.cache.push(Rc::downgrade(&pic));
         trim();
@@ -581,6 +584,7 @@ impl State {
             frame: std::cell::Cell::new(0),
             due: std::cell::Cell::new(Instant::now() + playing.video.interval),
             video: Some(playing),
+            stale: Default::default(),
         });
         self.cache.push(Rc::downgrade(&pic));
         Ok(pic)
@@ -642,6 +646,16 @@ impl State {
             for msg in buf[..n - n % 8].chunks_exact(8) {
                 let id = u32::from_ne_bytes(msg[..4].try_into().unwrap());
                 let slot = u32::from_ne_bytes(msg[4..].try_into().unwrap()) as usize;
+                if slot == u32::MAX as usize {
+                    // A fitted copy is ready: it replaces what showed meanwhile.
+                    for pic in self.shown_pics() {
+                        if pic.video.as_ref().is_some_and(|p| p.id == id) {
+                            pic.stale.set(true);
+                        }
+                    }
+                    self.apply_all();
+                    continue;
+                }
                 for pic in self.shown_pics() {
                     if let Some(p) = pic.video.as_ref().filter(|p| p.id == id) {
                         p.asked.set(false);
