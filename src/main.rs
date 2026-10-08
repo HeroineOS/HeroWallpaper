@@ -186,7 +186,11 @@ fn status() -> ! {
         line += &format!(" - videos play {video}");
     }
     if let Ok(p) = std::fs::read_to_string(runtime_file("preparing")) {
+        let (p, note) = p.split_once('\n').unwrap_or((&p, ""));
         line += &format!(" - preparing a copy of {p} fitted to the screen (once; a still until then)");
+        if !note.is_empty() {
+            line += &format!(", {note}");
+        }
     }
     println!("{line}");
     let problem = std::fs::read_to_string(runtime_file("status")).unwrap_or_default();

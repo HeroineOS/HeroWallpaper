@@ -158,9 +158,56 @@ impl Drop for Preparing {
     }
 }
 
-/// Starts making `copy` from `path`; `done` gets `(id, u32::MAX)` when it's
-/// there.
-fn prepare(path: &Path, copy: &Path, filter: String, (id, done): (u32, std::os::unix::net::UnixStream)) -> std::io::Result<Preparing> {
+/// Memory free for programs to take (MemAvailable), in bytes; unknown:
+/// as much as wanted.
+fn available() -> u64 {
+    std::fs::read_to_string("/proc/meminfo")
+        .ok()
+        .and_then(|m| m.lines().find_map(|l| l.strip_prefix("MemAvailable:").and_then(|v| v.trim().trim_end_matches("kB").trim().parse::<u64>().ok())))
+        .map_or(u64::MAX, |kb| kb * 1024)
+}
+
+/// About what ffmpeg takes to decode `info` (its frames in flight).
+fn decode_memory(info: &Info) -> u64 {
+    info.size.0 as u64 * info.size.1 as u64 * 3 / 2 * 10 + (40 << 20)
+}
+
+/// Makes ffmpeg the first thing the kernel ends when memory runs out
+/// (`adj` up to 1000), never the compositor or the desktop. Runs in the
+/// forked child: only system calls.
+fn first_to_go(cmd: &mut Command, adj: &'static [u8], nice: bool) {
+    use std::os::unix::process::CommandExt;
+    unsafe {
+        cmd.pre_exec(move || {
+            extern "C" {
+                fn open(path: *const std::ffi::c_char, flags: std::ffi::c_int, ...) -> std::ffi::c_int;
+                fn write(fd: std::ffi::c_int, buf: *const std::ffi::c_void, n: usize) -> isize;
+                fn close(fd: std::ffi::c_int) -> std::ffi::c_int;
+                fn setpriority(which: std::ffi::c_int, who: std::ffi::c_uint, prio: std::ffi::c_int) -> std::ffi::c_int;
+            }
+            const O_WRONLY: std::ffi::c_int = 1;
+            let fd = open(c"/proc/self/oom_score_adj".as_ptr(), O_WRONLY);
+            if fd >= 0 {
+                write(fd, adj.as_ptr().cast(), adj.len());
+                close(fd);
+            }
+            if nice {
+                // The lowest priority: whatever else runs comes first.
+                setpriority(0, 0, 19);
+            }
+            Ok(())
+        })
+    };
+}
+
+/// Starts making `copy` from `path`, when there's memory for it (about
+/// `memory` bytes); `done` gets `(id, u32::MAX)` when it's there.
+fn prepare(path: &Path, copy: &Path, filter: String, memory: u64, (id, done): (u32, std::os::unix::net::UnixStream)) -> std::io::Result<Preparing> {
+    // Started only with this much more free than it takes, and stopped
+    // when what's free falls under the floor (it starts over once there's
+    // room again): it never pushes the machine into swapping.
+    const ROOM: u64 = 300 << 20;
+    const FLOOR: u64 = 160 << 20;
     let dir = copy.parent().unwrap().to_path_buf();
     std::fs::create_dir_all(&dir)?;
     let part = copy.with_extension("part");
@@ -169,44 +216,58 @@ fn prepare(path: &Path, copy: &Path, filter: String, (id, done): (u32, std::os::
     let cancelled: std::sync::Arc<std::sync::atomic::AtomicBool> = Default::default();
     let (c, stop) = (child.clone(), cancelled.clone());
     std::thread::Builder::new().name("herowallpaper-fit".into()).stack_size(64 * 1024).spawn(move || {
-        let _ = std::fs::write(crate::runtime_file("preparing"), path.display().to_string());
-        // H.264 made quick to decode; else MPEG-4 (FFmpeg's own).
-        let encoders: [&[&str]; 2] = [&["-c:v", "libx264", "-preset", "veryfast", "-tune", "fastdecode", "-crf", "20", "-g", "120"], &["-c:v", "mpeg4", "-q:v", "3"]];
+        let stopped = || stop.load(std::sync::atomic::Ordering::SeqCst);
+        let note = |waiting: bool| {
+            let _ = std::fs::write(crate::runtime_file("preparing"), format!("{}\n{}", path.display(), if waiting { "waiting for free memory" } else { "" }));
+        };
         let mut ok = false;
-        for enc in encoders {
-            let mut cmd = Command::new("ffmpeg");
-            cmd.args(["-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-threads", "2", "-i"]).arg(&path);
-            cmd.args(["-an", "-sn", "-dn", "-vf", &filter, "-threads", "2", "-pix_fmt", "yuv420p"]).args(enc).args(["-f", "matroska"]).arg(&part);
-            cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
-            {
-                use std::os::unix::process::CommandExt;
-                // The lowest priority: whatever else runs comes first.
-                unsafe {
-                    cmd.pre_exec(|| {
-                        extern "C" {
-                            fn setpriority(which: std::ffi::c_int, who: std::ffi::c_uint, prio: std::ffi::c_int) -> std::ffi::c_int;
-                        }
-                        setpriority(0, 0, 19);
-                        Ok(())
-                    })
-                };
+        'tries: while !stopped() {
+            while available() < memory + ROOM {
+                note(true);
+                for _ in 0..20 {
+                    if stopped() {
+                        break 'tries;
+                    }
+                    std::thread::sleep(Duration::from_millis(250));
+                }
             }
+            note(false);
+            // One thread each and MPEG-4 (FFmpeg's own encoder): the least
+            // memory; the copy plays as cheaply as an H.264 one.
+            let mut cmd = Command::new("ffmpeg");
+            cmd.args(["-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-threads", "1", "-i"]).arg(&path);
+            cmd.args(["-an", "-sn", "-dn", "-vf", &filter, "-threads", "1", "-filter_threads", "1", "-pix_fmt", "yuv420p", "-c:v", "mpeg4", "-q:v", "3", "-f", "matroska"]).arg(&part);
+            cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+            first_to_go(&mut cmd, b"1000", true);
             let Ok(started) = cmd.spawn() else { break };
             *c.lock().unwrap() = Some(started);
+            let mut short = false;
             let status = loop {
-                if let Some(st) = c.lock().unwrap().as_mut().and_then(|ch| ch.try_wait().ok().flatten()) {
-                    break st;
+                let mut g = c.lock().unwrap();
+                let Some(ch) = g.as_mut() else { break None };
+                if let Some(st) = ch.try_wait().ok().flatten() {
+                    break Some(st);
                 }
-                std::thread::sleep(Duration::from_millis(300));
+                if !short && available() < FLOOR {
+                    short = true;
+                    let _ = ch.kill();
+                }
+                drop(g);
+                std::thread::sleep(Duration::from_millis(250));
             };
             *c.lock().unwrap() = None;
-            if stop.load(std::sync::atomic::Ordering::SeqCst) {
+            if stopped() {
                 break;
             }
-            if status.success() {
-                ok = std::fs::rename(&part, &copy).is_ok();
-                break;
+            if short {
+                let _ = std::fs::remove_file(&part);
+                if std::env::var_os("HEROWALLPAPER_DEBUG").is_some() {
+                    eprintln!("herowallpaper: memory ran low; the fitted copy starts over when there's room");
+                }
+                continue;
             }
+            ok = status.is_some_and(|s| s.success()) && std::fs::rename(&part, &copy).is_ok();
+            break;
         }
         let _ = std::fs::remove_file(&part);
         let _ = std::fs::remove_file(crate::runtime_file("preparing"));
@@ -224,7 +285,7 @@ fn prepare(path: &Path, copy: &Path, filter: String, (id, done): (u32, std::os::
 
 /// Keeps the fitted copies used last (each use touches its time).
 fn prune(dir: &Path) {
-    const KEEP: usize = 6;
+    const KEEP: usize = 4;
     let Ok(rd) = std::fs::read_dir(dir) else { return };
     let mut copies: Vec<(std::time::SystemTime, std::path::PathBuf)> = rd
         .flatten()
@@ -345,7 +406,29 @@ fn ffmpeg(path: &Path, filter: &str, moving: bool, decoder: &Decoder) -> std::io
     if !moving {
         cmd.args(["-frames:v", "1"]);
     }
-    cmd.args(["-f", "rawvideo", "pipe:1"]).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn()
+    if version() >= 7 {
+        // One finished frame waiting, not several: about 30 MB less while
+        // the pipe is full (FFmpeg 7 queues them between its threads).
+        cmd.args(["-thread_queue_size", "1"]);
+    }
+    cmd.args(["-f", "rawvideo", "pipe:1"]).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null());
+    first_to_go(&mut cmd, b"500", false);
+    cmd.spawn()
+}
+
+/// FFmpeg's major version (0: unknown).
+fn version() -> u32 {
+    static V: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        let out = Command::new("ffmpeg").arg("-version").stdin(Stdio::null()).stderr(Stdio::null()).output().map(|o| o.stdout).unwrap_or_default();
+        parse_version(&String::from_utf8_lossy(&out))
+    })
+}
+
+/// "ffmpeg version 8.1.2-2+b3 ..." → 8; "n7.1", "7.1.1" too.
+fn parse_version(text: &str) -> u32 {
+    let v = text.split_whitespace().nth(2).unwrap_or("");
+    v.trim_start_matches('n').split(|c: char| !c.is_ascii_digit()).next().and_then(|d| d.parse().ok()).unwrap_or(0)
 }
 
 /// Where the frames are, for the compositor.
@@ -392,7 +475,7 @@ impl Video {
         // Far more pixels or frames than the screen shows: a copy fitted to
         // it, made once (decoding a 4K video for a laptop screen takes
         // several times the CPU).
-        let mut preparing = None;
+        let mut to_prepare = None;
         let mut path = path.to_path_buf();
         if moving && needs_fitting(&info, &fit) {
             if let Some(copy) = fitted_dir().map(|d| d.join(fitted_name(&path, &fit))) {
@@ -405,10 +488,9 @@ impl Video {
                     }
                     _ => {
                         let _ = std::fs::remove_file(&copy);
-                        if let Ok(p) = prepare(&path, &copy, fitted_filter(&info, &fit), (id, done.try_clone().map_err(|e| e.to_string())?)) {
-                            preparing = Some(p);
-                            moving = false;
-                        }
+                        // Made once the first frame is in (one ffmpeg at a time).
+                        to_prepare = Some((path.clone(), copy, fitted_filter(&info, &fit), decode_memory(&info)));
+                        moving = false;
                     }
                 }
             }
@@ -471,6 +553,7 @@ impl Video {
                 }
             }
         };
+        let done_copy = done.try_clone();
         let (ask, asked) = mpsc::channel::<usize>();
         std::thread::Builder::new()
             .name("herowallpaper-video".into())
@@ -491,6 +574,14 @@ impl Video {
                 }
             })
             .map_err(|e| e.to_string())?;
+        let mut child = child;
+        let mut preparing = None;
+        if let Some((from, copy, filter, memory)) = to_prepare {
+            // The still's ffmpeg is done after its frame: gone before the
+            // copy's starts (one at a time, for memory).
+            let _ = child.wait();
+            preparing = prepare(&from, &copy, filter, memory, (id, done_copy.map_err(|e| e.to_string())?)).ok();
+        }
         Ok(Video { _preparing: preparing, child, ask: Some(ask), frames, size, dest: fit.dest, interval: Duration::from_secs_f64(1.0 / info.rate), moving })
     }
 
@@ -563,6 +654,15 @@ mod tests {
         let i = parse_probe("width=1920\nheight=1080\navg_frame_rate=0/0\nr_frame_rate=60/1\nrotation=-90\n").unwrap();
         assert_eq!((i.size, i.rate), ((1080, 1920), 60.0));
         assert_eq!(parse_probe("width=0\n"), None);
+    }
+
+    #[test]
+    fn ffmpeg_versions() {
+        assert_eq!(parse_version("ffmpeg version 8.1.2-2+b3 Copyright"), 8);
+        assert_eq!(parse_version("ffmpeg version n7.1 Copyright"), 7);
+        assert_eq!(parse_version("ffmpeg version 4.4.2-0ubuntu0.22.04.1"), 4);
+        assert_eq!(parse_version("ffmpeg version N-112345-gabc"), 0);
+        assert_eq!(parse_version(""), 0);
     }
 
     #[test]
